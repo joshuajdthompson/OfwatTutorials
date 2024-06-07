@@ -1,0 +1,340 @@
+---
+title: "Leveraging Geospatial Data on Stream at Ofwat - a simple tutorial"
+author: "Joshua Thompson"
+date: "2024-05-16"
+output:
+  html_notebook:
+    css: styles.css
+  html_document:
+    df_print: paged
+---
+
+
+There are several geospatial data sets on [Stream](https://portal-streamwaterdata.hub.arcgis.com/search), the water sector's open data portal. In this tutorial we will give a simple example of how geospatial data sets can be used in R to create visualisations, and combine it with other data to make some insights. 
+
+First, let's load some R libraries to get things going. 
+
+```{r set up, echo = T, results = 'hide', message=FALSE,warning=FALSE}
+
+# libraries for handling http requests and json files  
+library(httr)
+library(jsonlite)
+
+# libraries for data manipulation and visualisations 
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+library(extrafont)
+library(stringr)
+library(RColorBrewer)
+library(plotly)
+library(kableExtra)
+library(DT)
+
+# libraries for geospatial data 
+library(sf)
+library(sp)
+library(arcpullr)
+
+# load custom fonts - specifically Ofwat's font Krub
+loadfonts()
+```
+
+
+Next, let's define the companies we are interested as vector called `water_companies`. We can then use `get_spatial_layer` function from the `arcpullr` library to read data in an Esri format directly from the feature service on Stream. We want to check the projection, as all geospatial data need to have the same projection. 
+
+```{r read in the geospatial data, echo = T}
+
+# define the water companies we are interested in 
+water_companies <- c("ANH","WSH","HDD","NES","NNE","ESK","SVE",
+                     "SWB","SRN","TMS","UUW","WSX","YKY","AFW","BRL",
+                     "PRT","SEW","SSC","SST","CAM","SES")
+
+# read in the uk water companies 
+UKwatercompanies <- get_spatial_layer("https://services-eu1.arcgis.com/XxS6FebPX29TRGDJ/arcgis/rest/services/UC2/FeatureServer/0")
+
+# so what is this data stored as?
+class(UKwatercompanies) # an sf object from the simple features package
+
+# we can use filter from the dplyr package to filter our geospatial data 
+WCPR_Companies <- UKwatercompanies %>% filter(Acronym %in% water_companies)
+
+# we can check the projection of the feature class 
+prj <- st_crs(WCPR_Companies)
+
+# we can check the geometry to see if there's any slivers of geospatial impurities
+validity <- st_is_valid(WCPR_Companies)
+
+# oh dear, impure geometry geometry exists, but we can quickly repair that
+WCPR_Companies <- st_make_valid(WCPR_Companies)
+
+```
+
+Now we have this geospatial data, let's take a look at it.  We can plot a simple map, and label each polygon in the `WCPR_Companies` feature class. To make sure we know which company each polygon represents, we can calculate the centroid of each polygon (geometric middle), and add those labels to the plot.   
+
+```{r take a look at the data,echo = T, warning=FALSE}
+
+# calculate centroids of polygons (geometric middle) so we know where to put some labels
+WCPR_Companies_summary_centroids <- st_centroid(WCPR_Companies) %>% unique(.)
+WCPR_Companies_summary_centroids$X <- st_coordinates(WCPR_Companies_summary_centroids)[, 1]
+WCPR_Companies_summary_centroids$Y <- st_coordinates(WCPR_Companies_summary_centroids)[, 2]
+
+map1 <- ggplot() +
+  geom_sf(data = WCPR_Companies, color = "gray", fill = NA, lwd = 0.85) +
+  geom_text(data = WCPR_Companies_summary_centroids, aes(label = Acronym, x = X, y = Y), size = 3, color = "blue", check_overlap = TRUE) +  
+  theme_minimal()+
+  theme(
+    text = element_text(family = "Krub"),
+    axis.text.x = element_blank(),  
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    strip.background = element_rect(fill="black"),
+    strip.text = element_text(colour = 'white',face="bold",size = 12),
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.text.y = element_blank(),
+    legend.box.background = element_blank(),
+    legend.background = element_blank(),
+    legend.spacing.x = unit(0, "pt"),
+    legend.margin = margin(t=-0.5,l=0.05,b=0.05,r=0.05, unit='cm') 
+  ) 
+
+map1
+
+```
+
+
+... and voila. Pretty simple, but also a bit boring. Let's see if we can step it up a bit and combine it with some other data. Let's say we want to understand how many Environment Agency rainfall gauges are in each company area. We can read in the Environment Agency data directly using their [API](https://environment.data.gov.uk/hydrology/doc/reference). 
+
+We need to structure the url following strict guidelines, as outlined in their API documentation. In this request, we are looking for active stations that have been monitored between 2012 and 2024. We are setting a limit for the number of returned results as the default returns only 100, and I have a feeling the Environment Agency monitor more sites that that. 
+
+The metadata for each site contains their x and y location, so we can use this to see where they are. We can also use these numbers to create a new geospatial object using the `st_as_sf` function, and set the projection to match our `WCPR_Companies` object.  
+
+
+```{r get ea data,echo = T, results = 'hide', warning=FALSE, message=FALSE}
+
+# API URL
+url <-"https://environment.data.gov.uk/hydrology/id/open/stations?from=2012-04-01&to=2024-04-01&status.label=Active&observedProperty=rainfall&_limit=2000000"
+
+# make API request
+response <- GET(url)
+# check if request was successful
+if (http_status(response)$category == "Success") {
+  # parse JSON response
+  data <- fromJSON(content(response, "text"), flatten = TRUE)
+  
+  # extract relevant bits we are interested in
+  station_data <- data$items
+  station_df <- tibble(label = station_data$label,
+                         easting = station_data$easting,
+                         northing = station_data$northing,
+                         lat = station_data$lat,
+                         long = station_data$long,
+                         stationReference = station_data$stationReference)
+
+  # convert this flat table to a sf object
+  coordinates <- station_df[, c("long", "lat")]
+  colnames(coordinates) <- c("X", "Y")
+  station_sf <- st_as_sf(station_df, coords = c("long", "lat"), crs = st_crs(4326))
+  
+  # Print result
+  #plot(station_sf$geometry)
+} else {
+  print("Error: API request failed")
+}
+
+```
+
+
+We can use `nrow(station_sf)` to see that there are 974 sites - a fair few! Let's take a look and see if it makes sense visually and if we correctly converted this tabular data into a geospatial object. 
+
+```{r plot ea sites,echo = T}
+
+map2 <- ggplot() +
+  geom_sf(data = station_sf, color = "red", size = 1.25) +  
+  theme_minimal()+
+  theme(
+    text = element_text(family = "Krub"),
+    legend.background = element_blank(),
+    legend.spacing.x = unit(0, "pt"),
+    legend.margin = margin(t=-0.5,l=0.05,b=0.05,r=0.05, unit='cm')
+  )
+
+map2
+
+```
+
+Looking good. Let's see them plotted with the company boundaries. 
+
+```{r plot with company boundaries,echo = T, results = 'hide'}
+
+map3 <- ggplot() +
+  geom_sf(data = station_sf, color = "red", size = 1) +  
+  geom_sf(data = WCPR_Companies, color = "black", fill = NA, lwd = 0.85) +
+  labs(title = "Company areas with rainfall gauges") +
+  theme_minimal()+
+  theme(
+    text = element_text(family = "Krub"),
+    legend.background = element_blank(),
+    legend.spacing.x = unit(0, "pt"),
+    legend.margin = margin(t=-0.5,l=0.05,b=0.05,r=0.05, unit='cm')
+  )
+
+map3 
+```
+
+
+So far so good, but what if we wanted to use some basic geospatial analysis to see how many rainfall gauges are in each company area?  We can perform a spatial join, that joins two feature classes based on their spatial relationship using `st_join`. We can then use some `dplyr` functions to group the data by company acronym and count how many gauges are in each company area. 
+
+Once we have our flat table we can then join this table of counts to our original `WCPR_Companies` feature class using a `left_join`. 
+
+
+```{r spatial join, echo = T, results = 'hide'}
+
+# spatial join
+joined_data <- st_join(WCPR_Companies, station_sf)
+
+# number of gauges per water company
+station_count <- joined_data %>%
+  group_by(Acronym) %>%
+  summarise(Station_Count = n())
+
+# convert to a flat table
+station_count_flat <- station_count  %>%
+  ungroup() %>% as_tibble() %>%
+  select(-c(geoms))
+
+# merge gauge count with water company polygons
+WCPR_Companies <- WCPR_Companies %>% left_join(station_count_flat)
+
+
+```
+
+
+Seems to have worked! Let's plot it to see what it looks like. 
+
+```{r, echo = T, warning=FALSE, message=FALSE}
+map4 <- ggplot(WCPR_Companies, aes(fill = Station_Count)) +
+  geom_sf(color = "lightgrey") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", na.value = "grey50", name = " No. Gauges") +
+  labs(title = "Company Areas with Gauge Count") +
+  theme_minimal()+
+  theme(
+    text = element_text(family = "Krub"),
+    axis.text.x = element_blank(),  
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    strip.background = element_rect(fill="black"),
+    strip.text = element_text(colour = 'white',face="bold",size = 12),
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.text.y = element_blank(),
+    legend.box.background = element_blank(),
+    legend.background = element_blank(),
+    legend.spacing.x = unit(0, "pt"),
+    legend.margin = margin(t=-0.5,l=0.05,b=0.05,r=0.05, unit='cm')
+  )
+map4
+```
+
+Seems like a lot of gauges in each company area, but Wales seems poorly covered. This makes sense as we are looking at Environment Agency data only. 
+
+We now know where each station is in reference to company areas. So, let's randomly find a site within Yorkshire Water's area and have a look at the data.  We are using `tryCatch` here to help us troubleshoot any errors, as pulling time series data gets a bit more complicated and there's more that could go wrong.  
+
+```{r, echo = T, warning=FALSE, message=FALSE}
+
+#station <- joined_data %>% filter(Acronym == "YKY") %>% sample_n(min(n(), 1)) %>%
+#pull(stationReference) 
+
+station <- "037973"
+
+url.rain <- paste0("https://environment.data.gov.uk/hydrology/data/readings.json?max-date=2024-04-01&mineq-date=2012-04-01&period=86400&station.wiskiID=",as.character(station))
+
+# send API request
+response.rain <- GET(url.rain)
+
+if (http_status(response.rain)$category == "Success") {
+  # parse JSON 
+  data.rain <- tryCatch({
+    fromJSON(content(response.rain, "text"), flatten = TRUE)
+  }, error = function(e) {
+    message("Error parsing JSON: ", e)
+    return(NULL)
+  })
+  
+  # check if it worked
+  if (!is.null(data.rain)) {
+    # extract relevant bits we are interested in
+    station_data.rain <- data.rain$items
+    
+    # check if station data is available
+    if (!is.null(station_data.rain) && length(station_data.rain) > 0) {
+      # make tibble
+      station_df.rain <- tibble(
+        date = as.Date(station_data.rain$date),
+        rain_mm = station_data.rain$value,
+        station = station
+      ) %>% filter(complete.cases(.))
+      
+    } else {
+      message("No data available for the specified station and date range.")
+    }
+  } else {
+    message("Failed to parse JSON response.")
+  }
+} else {
+  message("Error: API request failed with status ", http_status(response.rain)$reason)
+}
+
+datatable(station_df.rain, caption = "Rainfall Data from the Environment Agency")
+```
+
+Looks OK. Let's plot it to see what it looks like. 
+
+```{r, echo = T, warning=FALSE, message=FALSE}
+
+# aggregate monthly total rainfall
+monthly_rainfall <- station_df.rain %>% filter(complete.cases(.))  %>%
+  mutate(year = year(date), month = month(date)) %>%
+  group_by(year, month) %>%
+  summarize(total_rain_mm = sum(rain_mm, na.rm = TRUE), .groups = 'drop') %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-"))) %>% 
+  filter(complete.cases(.))
+
+
+plot1 <- ggplot(monthly_rainfall %>% mutate(Title = paste0('Rainfall observed at station ',station)), aes(x = date, y = 1, fill = total_rain_mm)) +
+  facet_wrap(~Title,ncol=1) +
+  geom_tile() +
+  scale_x_date(expand = c(0, 0), date_breaks = "1 years", date_labels = "%Y") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_gradientn(colours = brewer.pal(9, "Blues"),
+                       guide = guide_colorbar(
+                         barheight = unit(3, units = "mm"),
+                         barwidth = unit(50, units = "mm"),
+                         title.vjust = 1)) +
+  labs(x = "Year", y = "",title = paste0("Created on ",Sys.Date()),fill = "Monthly Rainfall (mm)") +
+  theme(text = element_text(family = "Krub"), 
+        axis.text.x = element_text(angle = 0, vjust = 0, hjust=0.5,colour="black"),
+        strip.background = element_rect(fill="black"),
+        strip.text = element_text(colour = 'white',face="bold",size = 12),
+        panel.background = element_blank(),
+        panel.grid.major.x = element_line(size = 0.5, linetype = 'solid',
+                                          colour = "lightgrey"),
+        panel.border=element_rect(colour="black",size=1,fill=NA),
+        axis.text.y=element_blank(),axis.ticks.y = element_blank(),
+        legend.position = "bottom")
+
+ggplotly(plot1, width = 1000)
+
+
+```
+
+Now we could have a look to see if rainfall variability is driving outcomes in company performance. The sky is the limit!
